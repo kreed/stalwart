@@ -79,8 +79,25 @@ impl MeiliSearchStore {
     ) -> trc::Result<Vec<R>> {
         let filter_group = build_query(filters);
 
-        if filter_group.q.is_empty() && sort.is_empty() {
-            return self.fetch_documents(index, &filter_group.filter).await;
+        if filter_group.q.is_empty() {
+            match sort {
+                [] => {
+                    return self
+                        .fetch_documents(index, &filter_group.filter, None)
+                        .await;
+                }
+                [
+                    SearchComparator::Field {
+                        field: SearchField::Email(EmailSearchField::ReceivedAt),
+                        ascending,
+                    },
+                ] => {
+                    return self
+                        .fetch_documents(index, &filter_group.filter, Some(*ascending))
+                        .await;
+                }
+                _ => (),
+            }
         }
 
         let mut body = Map::new();
@@ -188,6 +205,7 @@ impl MeiliSearchStore {
         &self,
         index: SearchIndex,
         filter: &str,
+        received_ascending: Option<bool>,
     ) -> trc::Result<Vec<R>> {
         let url = format!(
             "{}/indexes/{}/documents/fetch",
@@ -203,7 +221,11 @@ impl MeiliSearchStore {
             body.insert("offset".to_string(), Value::from(offset));
             body.insert(
                 "fields".to_string(),
-                Value::Array(vec![Value::String("id".to_string())]),
+                if received_ascending.is_some() {
+                    json!(["id", "rcvd"])
+                } else {
+                    json!(["id"])
+                },
             );
 
             if !filter.is_empty() {
@@ -233,7 +255,7 @@ impl MeiliSearchStore {
                 .results;
 
             let total = documents.len();
-            results.extend(documents.into_iter().map(|hit| R::from_u64(hit.id)));
+            results.extend(documents);
 
             if total < MAX_SEARCH_RESULTS {
                 break;
@@ -242,7 +264,17 @@ impl MeiliSearchStore {
             offset += total;
         }
 
-        Ok(results)
+        if let Some(ascending) = received_ascending {
+            // Keep missing values last in both directions, and preserve fetch order for ties.
+            results.sort_by(|a, b| match (a.rcvd, b.rcvd) {
+                (Some(a), Some(b)) if ascending => a.cmp(&b),
+                (Some(a), Some(b)) => b.cmp(&a),
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, _) => std::cmp::Ordering::Greater,
+                (_, None) => std::cmp::Ordering::Less,
+            });
+        }
+        Ok(results.into_iter().map(|hit| R::from_u64(hit.id)).collect())
     }
 
     pub async fn unindex(&self, filter: SearchQuery) -> trc::Result<u64> {

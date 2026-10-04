@@ -117,6 +117,7 @@ pub async fn test(test: &TestServer) {
     let documents = Arc::new(Mutex::new(Vec::new()));
     let mut mask = RoaringBitmap::new();
     let mut fields = AHashMap::new();
+    let mut received = AHashMap::new();
 
     // Global ids test
     println!("Running global id filtering tests...");
@@ -268,6 +269,7 @@ pub async fn test(test: &TestServer) {
     for document in batches {
         let mut document_id = None;
         let mut to_field = None;
+        let mut received_at = None;
 
         for (key, value) in document.fields() {
             if key == &SearchField::DocumentId {
@@ -278,12 +280,17 @@ pub async fn test(test: &TestServer) {
                 && let SearchValue::Text { value, .. } = value
             {
                 to_field = Some(value.to_string());
+            } else if key == &SearchField::Email(EmailSearchField::ReceivedAt)
+                && let SearchValue::Uint(value) = value
+            {
+                received_at = Some(*value);
             }
         }
         let document_id = document_id.unwrap();
         let to_field = to_field.unwrap();
         mask.insert(document_id);
         fields.insert(document_id, to_field);
+        received.insert(document_id, received_at.unwrap());
 
         chunk.push(document);
         if chunk.len() == 10 {
@@ -365,6 +372,7 @@ pub async fn test(test: &TestServer) {
     println!("Running account sort tests...");
     let now = Instant::now();
     test_sort(store.clone(), &fields, &mask).await;
+    test_sort_document_set(store.clone(), &received, &mask).await;
     println!("Sorting took {} ms.", now.elapsed().as_millis());
 
     println!("Running unindex tests...");
@@ -671,6 +679,44 @@ async fn test_sort(store: SearchStore, fields: &AHashMap<u32, String>, mask: &Ro
             results.push(fields.get(&document_id).unwrap());
         }
         assert_eq!(results, expected_results);
+    }
+}
+
+async fn test_sort_document_set(
+    store: SearchStore,
+    received: &AHashMap<u32, u64>,
+    mask: &RoaringBitmap,
+) {
+    // A document set filter is applied locally, so the receivedAt sort is
+    // requested from the search store over the account's whole doc_id range.
+    let set = mask.iter().filter(|id| id % 3 == 0).collect::<RoaringBitmap>();
+
+    for ascending in [true, false] {
+        let ids = store
+            .query_account(
+                SearchQuery::new(SearchIndex::Email)
+                    .with_filters(vec![
+                        SearchFilter::eq(SearchField::AccountId, 0u32),
+                        SearchFilter::is_in_set(set.clone()),
+                    ])
+                    .with_comparator(SearchComparator::field(
+                        EmailSearchField::ReceivedAt,
+                        ascending,
+                    ))
+                    .with_mask(mask.clone()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(ids.len(), set.len() as usize);
+        assert_eq!(ids.iter().copied().collect::<RoaringBitmap>(), set);
+        assert!(
+            ids.windows(2).all(|pair| {
+                let (a, b) = (received[&pair[0]], received[&pair[1]]);
+                if ascending { a <= b } else { a >= b }
+            }),
+            "results not sorted by receivedAt (ascending: {ascending})"
+        );
     }
 }
 

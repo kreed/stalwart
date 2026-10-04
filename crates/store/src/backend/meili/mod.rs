@@ -66,4 +66,6 @@ struct MeiliDocumentsResponse {
 #[derive(Debug, Deserialize)]
 struct MeiliHit {
     id: u64,
+    #[serde(default)]
+    rcvd: Option<u64>,
 }
